@@ -1,53 +1,55 @@
 """
-MS Paint Daily Care  (Flask + Gemini)
-=====================================
+MS Paint Daily Care  (Flask + Gemini for CHAT ONLY)
+===================================================
 A retro Windows-style desktop with separate windows:
   * Daily Care : a gentle note, a doodle, a meme, a comfort video and a random fact
-  * Chat       : a goofy little chatbot that gives funny, soft replies
+  * Chat       : a goofy little chatbot that gives funny, soft replies  (the ONLY thing Gemini does)
   * Paint      : a real drawing window (pencil, brush, spray, fill, shapes, stamps...)
 
-Gemini is used for three things, all LIVE (nothing is cached per day):
-  1. gentle notes + comfort-video picks + a fun fact, in small fast batches
-  2. the chatbot's replies
-A background thread keeps a small "feed" of fresh items ready, so every click on
-"New Page" gets brand-new Gemini content instantly, and the feed refills itself.
-Doodles and memes are generated in the browser. Hug GIFs come live from Giphy.
+Everything in the Daily Care window now comes from big LOCAL lists in this file
+(notes, facts, videos, meme captions). No AI is used there, so it is instant and free.
+Hug GIFs still come live from Giphy (falls back to built-in GIFs).
+
+Add your own stuff without touching the code: create `my_content.json` next to app.py:
+    {
+      "notes":  [{"tag": "Hi", "message": "...", "subMessage": "..."}],
+      "facts":  ["..."],
+      "videos": [{"id": "11CHARVIDID", "title": "name.avi", "caption": "why it's nice"}],
+      "memes":  ["any caption that works with any picture"]
+    }
 
 Run:
-    pip install -r requirements.txt
-    cp .env.example .env      # then put your key in .env
+    pip install flask google-genai python-dotenv
     python app.py
 
 Optional .env settings:
-    FRIEND_NAME, SENDER_NAME, FRIEND_COUNTRY, REFRESH_TOKEN
+    GEMINI_API_KEY=...        # only needed for the chat window
+    FRIEND_NAME, SENDER_NAME, FRIEND_COUNTRY
     BOT_NAME=Pixel            # the chatbot's name
     GIPHY_API_KEY=...         # free at developers.giphy.com: live random hug GIFs
     ENABLE_CHAT=1             # 0 hides the chat window
-    CHAT_HOURLY_LIMIT=60      # max chat replies per hour
-    PREWARM=1                 # 0 disables background pre-generation
-    GEMINI_MODEL, GEMINI_RETRIES, PORT
+    CHAT_HOURLY_LIMIT=60      # max Gemini chat replies per hour
+    VERIFY_VIDEOS=1           # 0 skips the startup check that drops dead/non-embeddable videos
+    GEMINI_MODEL, PORT
 """
 
 import json
 import os
 import random
 import re
-import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request
 
 BASE_DIR = Path(__file__).parent
 
-# Load .env from next to this file and let it override stale shell variables.
 try:
     from dotenv import load_dotenv
 
@@ -58,7 +60,6 @@ except ImportError:
 try:
     from google import genai
     from google.genai import types
-    from pydantic import BaseModel
 
     GENAI_AVAILABLE = True
 except ImportError:
@@ -75,14 +76,9 @@ def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
-CACHE_FILE = BASE_DIR / "daily_care_cache.json"
-SEEN_FILE = BASE_DIR / "daily_care_seen.json"   # remembers recent picks so days do not repeat
-CACHE_SCHEMA = 4                                 # bump to invalidate old cache files
-
 FRIEND_NAME = env("FRIEND_NAME")
 SENDER_NAME = env("SENDER_NAME")
 FRIEND_COUNTRY = env("FRIEND_COUNTRY")
-REFRESH_TOKEN = env("REFRESH_TOKEN")
 BOT_NAME = env("BOT_NAME", "Pixel") or "Pixel"
 GIPHY_API_KEY = env("GIPHY_API_KEY")
 ENABLE_CHAT = env("ENABLE_CHAT", "1") == "1"
@@ -92,23 +88,14 @@ try:
 except ValueError:
     CHAT_HOURLY_LIMIT = 60
 
-# Tried in order. Set GEMINI_MODEL in .env to put your own choice first.
 _default_models = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
 GEMINI_MODELS = list(dict.fromkeys(m for m in [env("GEMINI_MODEL"), *_default_models] if m))
 
 VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
-FAILURE_COOLDOWN_SECONDS = 60
 CHAT_FAILURE_COOLDOWN_SECONDS = 30
+CHAT_TIMEOUT_SECONDS = 15
+CHAT_HTTP_TIMEOUT_SECONDS = 12
 
-try:
-    PACK_RETRY_ROUNDS = max(1, int(env("GEMINI_RETRIES", "2") or 2))
-except ValueError:
-    PACK_RETRY_ROUNDS = 2
-PACK_DEADLINE_SECONDS = 60       # stop retrying after this long
-PACK_HTTP_TIMEOUT_SECONDS = 25   # one request taking longer than this is retried
-
-_gen_lock = threading.Lock()
-_last_failure = {"time": 0.0, "error": None}
 _GOOD_MODEL_FILE = BASE_DIR / ".good_model"
 try:
     _good_model = {"name": _GOOD_MODEL_FILE.read_text(encoding="utf-8").strip() or None}
@@ -116,22 +103,17 @@ except OSError:
     _good_model = {"name": None}
 _chat_failure = {"time": 0.0}
 _chat_pool = ThreadPoolExecutor(max_workers=4)
-CHAT_TIMEOUT_SECONDS = 15
 _chat_times = deque()
 _chat_lock = threading.Lock()
-_progress = {"running": False, "pct": 0, "stage": "idle", "detail": "", "done": {}}
 
 
-def set_progress(pct, stage, detail=""):
-    _progress.update(pct=pct, stage=stage, detail=detail)
-
-
-def mark_done(step, info=""):
-    _progress["done"][step] = info
+def short(text, limit=220):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 # ==============================================================================
-# LOCAL CONTENT
+# LOCAL CONTENT  (edit freely, or add more via my_content.json)
 # ==============================================================================
 
 # Built-in hugs: used only when Giphy is unavailable (no key, offline, error).
@@ -166,6 +148,7 @@ HUG_CAPTIONS = [
 ]
 
 FACTS = [
+    # animals
     "Octopuses have three hearts.",
     "Sea otters hold hands while they sleep so they don't drift apart.",
     "A group of flamingos is called a flamboyance.",
@@ -173,59 +156,302 @@ FACTS = [
     "Bananas are berries, but strawberries aren't.",
     "Cows have best friends and get stressed when separated from them.",
     "Butterflies taste with their feet.",
-    "A day on Venus is longer than a year on Venus.",
     "Rats laugh when they are tickled.",
-    "Trees can share nutrients through underground fungal networks.",
     "Hummingbirds can fly backwards.",
     "Crows can recognise human faces and remember them.",
     "Koalas have fingerprints that look almost like human ones.",
     "Dolphins use signature whistles that work a bit like names.",
-    "The Moon drifts about 3.8 cm further from Earth every year.",
-    "Honey found in ancient Egyptian tombs was still edible.",
     "Sloths can hold their breath longer than dolphins can.",
     "Sea otters keep a favourite rock in a little skin pocket.",
-    "Your stomach lining replaces itself every few days.",
     "Penguins are great swimmers but can't fly. They still look fantastic in a tuxedo.",
+    "A group of owls is called a parliament.",
+    "A group of porcupines is called a prickle.",
+    "Baby puffins are called pufflings.",
+    "Cats have 32 muscles in each ear.",
+    "Starfish don't have a brain, and they still get around just fine.",
+    "Jellyfish have been drifting around the oceans for longer than dinosaurs existed.",
+    "Elephants can recognise themselves in a mirror.",
+    "Giraffes have the same number of neck bones as you do: seven. Theirs are just very long.",
+    "Axolotls can regrow lost limbs and even parts of their hearts.",
+    "Alpacas communicate with each other by humming.",
+    "Seahorse dads are the ones who carry the babies.",
+    "Pandas can spend up to 14 hours a day eating bamboo.",
+    "Quokkas look like they're smiling all the time.",
+    "Capybaras are famously friendly and get along with almost every other animal.",
+    "Polar bears have black skin under their white-looking fur.",
+    "Flamingos are pink because of the food they eat.",
+    "Tardigrades, tiny water bears, can survive in outer space.",
+    "A shrimp's heart is in its head.",
+    "Honeybees do a waggle dance to tell each other where the flowers are.",
+    "Fireflies make light without making heat. It's called cold light.",
+    "Sharks are older than trees.",
+    "Gentoo penguins sometimes give their partner a pebble as a gift.",
+    "Sea otters have the thickest fur of any animal.",
+    "Sea otters sometimes hold hands in big floating groups called rafts.",
+    "Dogs have nose prints that are unique, a bit like fingerprints.",
+    "Cats sleep for about 12 to 16 hours a day. Professionals.",
+    "A hummingbird's heart can beat over a thousand times a minute.",
+    "Whales sing songs that can travel across huge stretches of ocean.",
+    "Squirrels forget where they bury some of their nuts, and those nuts often grow into trees.",
+    "The platypus glows under ultraviolet light.",
+    "Otters have a favourite pocket, and baby otters can't even swim at first. Mums carry them.",
+    # nature & earth
+    "Trees can share nutrients through underground fungal networks.",
+    "Honey found in ancient Egyptian tombs was still edible.",
+    "Sunflowers turn to follow the sun when they're young.",
+    "Some bamboo can grow almost a metre in a single day.",
+    "Antarctica is technically a desert.",
+    "Lightning can be hotter than the surface of the sun.",
+    "A rainbow is really a full circle. From the ground you only see half.",
+    "Most of the ocean floor has still never been mapped in detail.",
+    "There's a type of jellyfish that can, in a way, start its life cycle over again.",
+    "Mount Everest keeps growing by a tiny amount every year.",
+    "Some turtles can breathe a little through their skin and the back end. Yes, really.",
+    # space
+    "A day on Venus is longer than a year on Venus.",
+    "The Moon drifts about 3.8 cm further from Earth every year.",
+    "Saturn is so light for its size that it would float in a big enough bathtub.",
+    "Sunlight takes about eight minutes to get to Earth.",
+    "Venus spins backwards compared to most planets.",
+    "Astronauts can grow a couple of centimetres taller in space.",
+    "A teaspoon of neutron star would weigh billions of tons.",
+    "Jupiter's Great Red Spot is a storm that's been swirling for hundreds of years.",
+    "Footprints on the Moon can last for a very, very long time because there's no wind.",
+    # human & fun
+    "Your stomach lining replaces itself every few days.",
+    "Your heart beats about 100,000 times every day without being asked.",
+    "Your brain uses about a fifth of your body's energy, even when you're just lying there.",
+    "Smelling something can bring back a memory faster than almost any other sense.",
+    "Yawning is contagious, even from reading about it. (Sorry.)",
+    "Humans are the only animals that cry tears because of emotion, as far as we know.",
+    "Your bones are mostly alive and constantly rebuilding themselves.",
+    "A cloud can weigh as much as hundreds of elephants and still float.",
+    "Popcorn pops because of the tiny drop of water inside each kernel turning to steam.",
+    "Chocolate was once used as money by the Aztecs.",
+    "The shortest war in history lasted under an hour.",
+    "Cats can't taste sweetness.",
 ]
 
-SUPPORT_NOTES = [
-    {"tag": "Gym Victory",
-     "message": "Showing up and crying at the gym still counts as showing up. Your body was just letting off steam while carrying a heavy load.",
-     "subMessage": "Zero guilt. Drink some water and be proud you went at all."},
-    {"tag": "No Reply Needed",
-     "message": "You do not have to text back, explain how you feel, or pretend to have energy today. I care about you unconditionally.",
-     "subMessage": "Just read this, take one slow breath, and close the tab if you want."},
-    {"tag": "Tiny Win",
-     "message": "If today's only achievement is that you're still here and breathing, that is a real achievement and I'm counting it.",
-     "subMessage": "Anything else you manage is bonus points."},
-    {"tag": "Low Battery Day",
-     "message": "Some days run on 3% battery. That's not a character flaw, it's just a day. Rest is allowed.",
-     "subMessage": "No one is keeping score. Especially not me."},
-    {"tag": "Distance Doesn't Count",
-     "message": "Different country, different time zone, same friend. I'm thinking of you and nothing is expected back.",
-     "subMessage": "Think of this page as a postcard that doesn't need a reply."},
-    {"tag": "Be Gentle",
-     "message": "You wouldn't yell at a friend for being tired. Try giving yourself the same softness today, even just a little.",
-     "subMessage": "Water, a snack, a window opened. That's a whole routine."},
-    {"tag": "Slow Is Fine",
-     "message": "Healing isn't a straight line and it isn't a race. Slow days, sideways days and stuck days are all part of it.",
-     "subMessage": "You're not behind. There's no schedule."},
-    {"tag": "Just Checking In",
-     "message": "No questions, no pressure, no fixing. This is just a note to say you're on my mind and you matter to me.",
-     "subMessage": "Come back tomorrow for another one, or don't. Either way is okay."},
+# Each note: (tag, message, subMessage)
+_NOTES_RAW = [
+    ("Gym Victory", "Showing up and crying at the gym still counts as showing up. Your body was just letting off steam while carrying a heavy load.", "Zero guilt. Drink some water and be proud you went at all."),
+    ("No Reply Needed", "You do not have to text back, explain how you feel, or pretend to have energy today. I care about you unconditionally.", "Just read this, take one slow breath, and close the tab if you want."),
+    ("Tiny Win", "If today's only achievement is that you're still here and breathing, that is a real achievement and I'm counting it.", "Anything else you manage is bonus points."),
+    ("Low Battery Day", "Some days run on 3% battery. That's not a character flaw, it's just a day. Rest is allowed.", "No one is keeping score. Especially not me."),
+    ("Distance Doesn't Count", "Different country, different time zone, same friend. I'm thinking of you and nothing is expected back.", "Think of this page as a postcard that doesn't need a reply."),
+    ("Be Gentle", "You wouldn't yell at a friend for being tired. Try giving yourself the same softness today, even just a little.", "Water, a snack, a window opened. That's a whole routine."),
+    ("Slow Is Fine", "Healing isn't a straight line and it isn't a race. Slow days, sideways days and stuck days are all part of it.", "You're not behind. There's no schedule."),
+    ("Just Checking In", "No questions, no pressure, no fixing. This is just a note to say you're on my mind and you matter to me.", "Come back tomorrow for another one, or don't. Either way is okay."),
+    ("Blanket Mode", "Today is officially a blanket day. The to-do list can wait outside, it has a coat.", "Tea optional. Snacks encouraged."),
+    ("Small Steps", "Brushing your teeth is a win. Opening a curtain is a win. Eating something warm is a win. The bar is on the floor and that's fine.", "Step over it and call it a day."),
+    ("Not Alone", "Even when it feels quiet, there's someone on the other side of the world who's glad you exist.", "That someone is me. Hi."),
+    ("Rest Is Work", "Resting isn't laziness. It's your brain doing repairs in the background, like a very slow software update.", "Please do not restart your life during the update."),
+    ("Bad Days Pass", "A bad day isn't a bad life. It's just weather, and weather changes, even if it's slow about it.", "Umbrella up. I'll sit in the rain with you, virtually."),
+    ("Zero Expectations", "You don't have to be productive, cheerful or interesting today. Just being you is plenty.", "I like you at 100% and at 3%."),
+    ("Proud Of You", "I'm proud of you, and not for achievements. For getting through days that nobody else can see how hard they are.", "That's real strength, even when it's quiet."),
+    ("Soft Landing", "If everything feels too loud, this page is a quiet corner. Nothing here needs anything from you.", "Pull up a chair, or lie down. Both are good."),
+    ("Snack Report", "Official update: snacks are a valid form of self-care and a cracker counts as dinner on certain days.", "No nutrition lectures here."),
+    ("Mood Weather", "Your mood doesn't have to match the forecast. Cloudy inside while it's sunny outside is allowed.", "I'll bring the metaphorical raincoat."),
+    ("You Matter", "Not because of what you do. Just because you're you, which is a pretty great thing to be.", "Evidence: I wrote this on purpose."),
+    ("Okay To Cancel", "If you have plans and no energy, cancelling gently is allowed. The people who love you will get it.", "And if they don't, send them to me."),
+    ("Friend Fact", "Friends don't need you to be fun. They just like having you around, even if you're lying on the floor.", "Floor friendship is underrated."),
+    ("Gentle Reminder", "Water, food, a window, some air. Four tiny things and you're already doing life better than you think.", "Pick one. Or none. I'm not the boss of you."),
+    ("Two Truths", "Things can be hard and you can be doing great at the same time. Both are true.", "Hold both. Or put them both down for a minute."),
+    ("Bedtime Energy", "Sleep is not a reward for doing enough. It's a right. Go be a horizontal person whenever you want.", "Pillows have been told to behave."),
+    ("Silly Truth", "You're like a phone on 3% that still manages to send the one important message. Impressive, honestly.", "Find a charger when you can. No rush."),
+    ("Warm Thoughts", "I'm sending you a very warm, very ordinary, very sincere thought. It's small but it's from the heart.", "It's already delivered. Nothing to do."),
+    ("Not A Burden", "You're not a burden to the people who love you. You're just a person having a hard time, and they'd rather know.", "Including me."),
+    ("Cloud Watching", "Some days the best plan is to look out of a window and let your brain float by like a cloud.", "Clouds don't have deadlines either."),
+    ("Good Enough", "You did enough today. Not 'almost enough'. Actually enough. Signed, an unbiased observer.", "Yes, I'm biased, but I'm also right."),
+    ("Hard Mode", "If life feels like it's on hard mode, that's because it is. Anyone who tells you otherwise is playing on easy.", "You're doing great for hard mode."),
+    ("Little Light", "A tiny bit of light is still light. A small smile, a single laugh, a nice song. They all count.", "Collect them like shiny pebbles."),
+    ("Permission Slip", "You are officially excused from: replying, explaining, being cheerful, and cleaning your room.", "Valid until further notice."),
+    ("Tea Break", "Pause. Hands around something warm. Three slow breaths. That's it. That's the whole task.", "Gold star either way."),
+    ("Crying Is Fine", "Crying is just your eyes doing laundry. It's allowed and often helpful.", "Fresh towel optional."),
+    ("Still Me", "On the quiet days you're still the same funny, kind person I know. The brain fog doesn't change that.", "I can wait for the fog to pass."),
+    ("Rainy Day Club", "Welcome to the Rainy Day Club. Membership: you, me, and a large supply of metaphorical blankets.", "Meetings are optional and mostly napping."),
+    ("No Fixing", "Nobody needs you to be fixed. You're a whole person who's having a hard time, not a broken thing.", "Come as you are."),
+    ("Tiny Brave", "Telling someone how you feel, even a little, is brave. Sending 'today is hard' counts as a full speech.", "Anytime, no matter how short."),
+    ("Over The Distance", "Across oceans and time zones, I'm still rooting for you at full volume.", "Imagine very enthusiastic cheering."),
+    ("Lazy Is Fine", "Doing nothing is also doing something. You're doing 'staying alive and being cosy', which is a great job.", "Excellent performance review."),
+    ("Today Only", "You only have to do today. Not next week, not next month. Just this one slightly awkward day.", "And even that, only the easy bits."),
+    ("Dumb Joke", "I'd tell you a joke about a potato but it's a bit of a mashup.", "I'll see myself out."),
+    ("Kind Voice", "If your inner voice is being mean today, imagine someone who loves you saying it instead. Notice the difference.", "That kinder voice is closer to the truth."),
+    ("Moon Message", "The moon works nights, goes through phases, and still shows up. You can have phases too.", "Full, half, hidden: all valid."),
+    ("Snail Pace", "Snails get everywhere eventually and nobody calls them late.", "Go at snail speed. Bring snacks."),
+    ("Comfort Pile", "Build a nest of cushions and blankets, add something soft to look at, and consider the day handled.", "Extra credit for a mug."),
+    ("Pocket Hug", "Here's a hug for your pocket. Take it out whenever you need one, no explanation needed.", "It never runs out. Trust me."),
+    ("Messy Is Okay", "A messy room, a messy week, a messy feeling. None of it says anything bad about you.", "Mess is just evidence of a living person."),
+    ("Thanks For Staying", "Thank you for staying. For every day you've made it through, even the ones that took everything you had.", "I'm really glad you're here."),
+]
+SUPPORT_NOTES = [{"tag": t, "message": m, "subMessage": s} for t, m, s in _NOTES_RAW]
+
+# Each video: (YouTube ID, file-style title, caption). Dead links are dropped on startup.
+_VIDEOS_RAW = [
+    ("jfKfPfyJRdk", "lofi_chill_beats.avi", "Cozy lo-fi beats to turn your brain off"),
+    ("rUxyKA_-grg", "lofi_sleepy_radio.avi", "Sleepy lo-fi for gentle evenings"),
+    ("5qap5aO4i9A", "cozy_study_girl.avi", "Warm ambient music while you just rest or sip tea"),
+    ("UfcAVejslrU", "weightless.avi", "Music made to slow your heart down a bit"),
+    ("L_LUpnjgPso", "cozy_fireplace.avi", "A crackly fireplace for a very cosy room"),
+    ("J---aiyznGQ", "keyboard_cat_classic.avi", "A 54-second internet classic that requires zero brain cells"),
+    ("2yJgwwDcgV8", "nyan_cat_nostalgia.avi", "Pure 2011 internet nostalgia serotonin boost"),
+    ("QH2-TGUlwu4", "nyan_cat_original.avi", "The original rainbow cat, flying forever"),
+    ("0Bmhjf0rKe8", "surprised_kitty.avi", "One tiny kitten with a very big reaction"),
+    ("FzRH3iTQPrk", "sneezing_panda.avi", "A baby panda sneezes and a whole room loses it"),
+    ("txqiwrbYGrs", "david_after_dentist.avi", "Peak 'is this real life?' energy"),
+    ("OQSNhk5ICTI", "double_rainbow.avi", "A very emotional response to a double rainbow"),
+    ("_OBlgSz8sSM", "charlie_bit_my_finger.avi", "A tiny classic with maximum chaos"),
+    ("MtN1YnoL46Q", "the_duck_song.avi", "A duck, some lemonade, and big grape energy"),
+    ("EIyixC9NsLI", "badger_badger.avi", "Mushroom mushroom. You'll see."),
+    ("0E00Zuayv9Q", "pen_pineapple.avi", "Short, silly and weirdly catchy"),
+    ("a1Y73sPHKxw", "dramatic_chipmunk.avi", "Five seconds of extremely dramatic rodent"),
+    ("jofNR_WkoCE", "what_does_the_fox_say.avi", "Nobody knows. Everyone dances."),
+    ("ZZ5LpwO-An4", "he_man_hey_yeah.avi", "A completely unnecessary but delightful singalong"),
+    ("dMH0bHeiRNg", "evolution_of_dance.avi", "A whole lot of dance in six minutes"),
+    ("jNQXAC9IVRw", "me_at_the_zoo.avi", "The very first YouTube video. Elephants."),
+    ("dQw4w9WgXcQ", "never_gonna.avi", "A classic prank, but also a genuinely cheerful song"),
+    ("ZbZSe6N_BXs", "happy.avi", "Happy-song energy, no pressure to join in"),
+    ("d-diB65scQU", "dont_worry.avi", "Worry-free whistling for a few minutes"),
+    ("VqhCQZaH4Vs", "wonderful_world.avi", "A warm old song with a warm old voice"),
+    ("zaGUr6wzyT8", "three_little_birds.avi", "Every little thing is gonna be alright, said a song"),
+    ("KQetemT1sWc", "here_comes_the_sun.avi", "Slow sunshine in song form"),
+    ("bEeaS6fuUoA", "lovely_day.avi", "A very long held note and a very good mood"),
+    ("fJ9rUzIMcZQ", "bohemian.avi", "Full-volume singalong permission slip"),
+]
+COMFORT_VIDEOS = [{"id": i, "title": t, "caption": c} for i, t, c in _VIDEOS_RAW]
+
+# Meme captions that work with ANY picture (the per-picture ones live in the page's JavaScript).
+MEME_LINES = [
+    "me: i should do something productive. also me: *looks at wall*",
+    "my to-do list and i have agreed to see other people today",
+    "brain: here's a thought. me: no thank you, i'm full",
+    "tiny victory: i exist and i'm wearing something",
+    "me explaining to my body why we're not doing anything today: it's an ecosystem",
+    "plans cancelled. joy detected.",
+    "i'm not lazy, i'm in energy-saving mode",
+    "my personality today: horizontal",
+    "if i ignore my problems long enough, they become a hobby",
+    "me at 3%: still the funniest person in the room, don't @ me",
+    "dear brain, can we have one (1) quiet day",
+    "i didn't ask to be a morning person, a night person or any kind of person. i just wanna nap",
+    "the bar was on the floor so i tripped over it and called it a win",
+    "doing my best. my best is currently a snack and a nap.",
+    "when someone says 'what's the plan?' and your plan is a blanket",
+    "me trying to adult: 404 not found",
+    "update: i've left my body on the couch and will return shortly",
+    "i love a quiet day where nothing happens and nobody asks me anything",
+    "current mood: dramatic sigh, but make it cute",
+    "no thoughts, head full of dust bunnies",
+    "if tired was an olympic sport i'd have a very comfy gold medal",
+    "emotionally i'm a houseplant. water me and leave me alone",
+    "just here to have snacks and feel mildly okay",
+    "everything is fine. i'm just a bit melted.",
+    "me: i'll rest for five minutes. also me, three hours later:",
+    "my superpower is being very still in a very comfortable position",
+    "one day at a time. sometimes one hour at a time. sometimes one snack.",
+    "i woke up. that's the whole headline.",
+    "please hold while i get my brain from the charger",
+    "today's forecast: couch with a high chance of nothing",
+    "that feeling when you survive a whole Tuesday",
+    "i don't need a plan, i need a pillow fort",
+    "the cat has the right idea. cat is asleep. cat is winning.",
+    "it's called 'strategic horizontal time'",
+    "a gentle reminder that you are not behind, there's no schedule",
+    "me, a deeply tired genius, closing 47 tabs of thoughts",
+    "i made it through the day. no further questions.",
+    "ctrl + z on the last five years? no? okay. snack then.",
+    "if you're reading this, drink some water. that's it. that's the meme.",
+    "proud of you for reading a meme on a hard day. seriously.",
 ]
 
-# Curated fallback clips (used if Gemini is offline or returns no playable videos).
-COMFORT_VIDEOS = [
-    {"id": "jfKfPfyJRdk", "title": "lofi_chill_beats.avi",
-     "caption": "Cozy background rain & lo-fi beats to turn your brain off"},
-    {"id": "J---aiyznGQ", "title": "keyboard_cat_classic.avi",
-     "caption": "A 54-second internet classic that requires zero brain cells"},
-    {"id": "2yJgwwDcgV8", "title": "nyan_cat_nostalgia.avi",
-     "caption": "Pure 2011 internet nostalgia serotonin boost"},
-    {"id": "5qap5aO4i9A", "title": "cozy_study_girl.avi",
-     "caption": "Warm ambient music while you just rest or sip tea"},
-]
+
+def load_extras():
+    """Merge optional my_content.json (your own notes/facts/videos/memes) into the lists above."""
+    path = BASE_DIR / "my_content.json"
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[Content] Could not read my_content.json: {exc}")
+        return
+    if not isinstance(data, dict):
+        return
+    for n in data.get("notes", []):
+        if isinstance(n, dict) and n.get("message"):
+            SUPPORT_NOTES.append({"tag": str(n.get("tag", "For You")), "message": str(n["message"]),
+                                  "subMessage": str(n.get("subMessage", ""))})
+    for f in data.get("facts", []):
+        if isinstance(f, str) and f.strip():
+            FACTS.append(f.strip())
+    for v in data.get("videos", []):
+        if isinstance(v, dict) and VIDEO_ID_RE.match(str(v.get("id", ""))):
+            COMFORT_VIDEOS.append({"id": v["id"], "title": str(v.get("title", "clip.avi")),
+                                   "caption": str(v.get("caption", "A comfort clip"))})
+    for m in data.get("memes", []):
+        if isinstance(m, str) and m.strip():
+            MEME_LINES.append(m.strip())
+    print(f"[Content] Loaded extras from my_content.json")
+
+
+def youtube_is_playable(video_id):
+    """Ask YouTube's oEmbed endpoint whether the video exists and allows embedding."""
+    if not VIDEO_ID_RE.match(video_id):
+        return False
+    watch = f"https://www.youtube.com/watch?v={video_id}"
+    url = "https://www.youtube.com/oembed?format=json&url=" + urllib.parse.quote(watch, safe="")
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError:
+        return False                      # 401/403/404 = removed or embedding disabled
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return None                       # network problem: can't tell
+
+
+def verify_videos_in_background():
+    """Drop videos YouTube says are dead/non-embeddable. If we're offline, keep everything."""
+    def work():
+        snapshot = list(COMFORT_VIDEOS)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda v: youtube_is_playable(v["id"]), snapshot))
+        if any(r is None for r in results) or not any(results):
+            print("[Videos] Could not verify (offline?). Keeping the full list.")
+            return
+        dead = [v for v, ok in zip(snapshot, results) if ok is False]
+        for v in dead:
+            if v in COMFORT_VIDEOS:
+                COMFORT_VIDEOS.remove(v)
+        print(f"[Videos] {len(COMFORT_VIDEOS)} playable, removed {len(dead)} dead: {[v['id'] for v in dead]}")
+    threading.Thread(target=work, name="verify-videos", daemon=True).start()
+
+
+def fetch_giphy_gif(query):
+    """Random G-rated GIF for a search phrase. Needs GIPHY_API_KEY; returns "" on any problem."""
+    if not GIPHY_API_KEY or not query:
+        return ""
+    for offset in (random.randint(0, 40), 0):
+        url = "https://api.giphy.com/v1/gifs/search?" + urllib.parse.urlencode(
+            {"api_key": GIPHY_API_KEY, "q": query[:80], "limit": 25, "offset": offset,
+             "rating": "g", "lang": "en"})
+        try:
+            with urllib.request.urlopen(url, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            urls = []
+            for g in data.get("data", []):
+                u = ((g.get("images") or {}).get("fixed_height") or {}).get("url", "")
+                if isinstance(u, str) and u.startswith("https://") and ".giphy.com/" in u:
+                    urls.append(u)
+            if urls:
+                return random.choice(urls)
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+            return ""
+    return ""
+
+
+# ==============================================================================
+# CHAT (Gemini lives only here)
+# ==============================================================================
 
 LOCAL_CHAT = {
     r"\b(hi|hey|hello|yo|sup|hiya)\b": [
@@ -293,25 +519,6 @@ CRISIS_REPLIES = [
 ]
 
 
-# ==============================================================================
-# GEMINI HELPERS
-# ==============================================================================
-
-if GENAI_AVAILABLE:
-    class DailyItem(BaseModel):
-        tag: str
-        message: str
-        subMessage: str
-        youtubeVideoId: str
-        videoCaption: str
-        fact: str
-
-
-def short(text, limit=220):
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
 def make_client(timeout=None):
     api_key = env("GEMINI_API_KEY")
     if timeout:
@@ -325,318 +532,28 @@ _RETRYABLE_RE = re.compile(
     re.IGNORECASE)
 
 
-def _is_retryable(exc, code):
-    return code in RETRYABLE_CODES or bool(_RETRYABLE_RE.search(str(exc)))
-
-
-def call_gemini(client, on_status=None, max_rounds=1, deadline=None, **kwargs):
-    """
-    Try each configured model in order (the one that last worked goes first).
-    Temporary errors (overloaded / rate limited / timeout) are retried for up to
-    `max_rounds` rounds or until `deadline`. Returns (response, model_used, attempts).
-    """
-    attempts = []
-    tried = set()
-    key_rejected = False
-
-    def status(text):
-        if on_status:
-            on_status(text)
-
-    def try_models(models):
-        nonlocal key_rejected
-        active = [m for m in dict.fromkeys(models) if m not in tried]
-        for round_no in range(1, max_rounds + 1):
-            retry_later, last_code = [], None
-            for model in active:
-                if deadline and time.time() > deadline:
-                    return None
-                tried.add(model)
-                suffix = f" (round {round_no}/{max_rounds})" if max_rounds > 1 else ""
-                status(f"Asking {model}…{suffix}")
-                try:
-                    response = client.models.generate_content(model=model, **kwargs)
-                    attempts.append({"model": model, "ok": True})
-                    if _good_model["name"] != model:
-                        _good_model["name"] = model
-                        try:
-                            _GOOD_MODEL_FILE.write_text(model, encoding="utf-8")
-                        except OSError:
-                            pass
-                    return response, model
-                except Exception as exc:  # noqa: BLE001
-                    code = getattr(exc, "code", None)
-                    attempts.append({"model": model, "ok": False, "code": code, "error": short(exc)})
-                    print(f"[Gemini] {model} failed ({code}): {short(exc, 300)}")
-                    if code in (400, 401, 403) and re.search(r"API key|API_KEY|permission|PERMISSION", str(exc)):
-                        key_rejected = True
-                        return None
-                    if _is_retryable(exc, code):
-                        retry_later.append(model)
-                        last_code = code
-            if not retry_later or round_no == max_rounds:
-                break
-            wait = min(30, 3 * 2 ** (round_no - 1)) + random.randint(0, 2)
-            for left in range(wait, 0, -1):
-                if deadline and time.time() > deadline:
-                    return None
-                status(f"Gemini is busy ({last_code or 'timeout'}). Retrying in {left}s… (round {round_no + 1}/{max_rounds})")
-                time.sleep(1)
-            active = retry_later
-        return None
-
+def call_gemini(client, **kwargs):
+    """Try each configured model in order (the one that last worked goes first). Returns (response, model)."""
     preferred = [_good_model["name"], *GEMINI_MODELS] if _good_model["name"] else GEMINI_MODELS
-    result = try_models(list(dict.fromkeys(preferred)))
-    if result:
-        return result[0], result[1], attempts
-
-    # Model names go stale: ask Google which plain "gemini-X.Y-flash" models this key can use.
-    if not key_rejected and not (deadline and time.time() > deadline):
+    errors = {}
+    for model in dict.fromkeys(preferred):
         try:
-            found = []
-            for m in client.models.list():
-                name = (m.name or "").replace("models/", "")
-                match = re.fullmatch(r"gemini-(\d+(?:\.\d+)*)-flash", name)
-                if match and "generateContent" in (getattr(m, "supported_actions", None) or []):
-                    found.append((tuple(int(p) for p in match.group(1).split(".")), name))
-            discovered = [name for _, name in sorted(found, reverse=True)]
-            print(f"[Gemini] Auto-discovered models: {discovered}")
-            result = try_models(discovered)
-            if result:
-                return result[0], result[1], attempts
+            response = client.models.generate_content(model=model, **kwargs)
+            if _good_model["name"] != model:
+                _good_model["name"] = model
+                try:
+                    _GOOD_MODEL_FILE.write_text(model, encoding="utf-8")
+                except OSError:
+                    pass
+            return response, model
         except Exception as exc:  # noqa: BLE001
-            print(f"[Gemini] Model discovery failed: {short(exc, 200)}")
-
-    last_error = {a["model"]: a.get("error", "ok") for a in attempts}
-    summary = "; ".join(f"{m}: {e}" for m, e in last_error.items())
-    err = RuntimeError(f"All Gemini models failed. {summary}")
-    err.attempts = attempts
-    raise err
-
-
-def parse_json_array(text):
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\[.*\]", text, re.DOTALL)
-        if not match:
-            raise
-        data = json.loads(match.group(0))
-    if isinstance(data, dict):
-        for value in data.values():
-            if isinstance(value, list):
-                return value
-    return data
-
-
-def youtube_is_playable(video_id):
-    """Ask YouTube's oEmbed endpoint whether the video exists and allows embedding."""
-    if not VIDEO_ID_RE.match(video_id):
-        return False
-    watch = f"https://www.youtube.com/watch?v={video_id}"
-    url = "https://www.youtube.com/oembed?format=json&url=" + urllib.parse.quote(watch, safe="")
-    try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            return resp.status == 200
-    except (urllib.error.URLError, TimeoutError, ValueError):
-        return False
-
-
-def read_seen():
-    try:
-        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def write_seen(items):
-    """Remember recent videos and tags so the next days differ."""
-    seen = read_seen()
-    for key, field in (("videos", "youtubeVideoId"), ("tags", "tag")):
-        values = [it.get(field, "") for it in items if it.get(field)]
-        seen[key] = (list(seen.get(key, [])) + values)[-60:]
-    try:
-        SEEN_FILE.write_text(json.dumps(seen, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError as exc:
-        print(f"[Seen] Could not write: {exc}")
-
-
-def build_batch_prompt(n):
-    who = f"my friend {FRIEND_NAME}" if FRIEND_NAME else "a close friend"
-    where = f" who lives in {FRIEND_COUNTRY}" if FRIEND_COUNTRY else " who lives in another country"
-    sender = f" The notes are from {SENDER_NAME}." if SENDER_NAME else ""
-    seen = read_seen()
-    avoid_videos = ", ".join(seen.get("videos", [])[-40:])
-    avoid_tags = ", ".join(seen.get("tags", [])[-30:])
-    video_avoid = f" Do NOT use any of these IDs: {avoid_videos}." if avoid_videos else ""
-    tag_avoid = f" Avoid these recent tags: {avoid_tags}." if avoid_tags else ""
-    return f"""Write {n} unique, warm, gentle care items for {who}{where}, who is going through depression.{sender}
-
-Rules:
-- Zero pressure: never ask them to reply, never give orders, no "you should".
-- No toxic positivity, no "just think positive", no "everything happens for a reason".
-- No medical advice, no mention of self-harm or suicide.
-- Short and human. Light, soft humour is welcome. Each item must feel different.
-- 'tag': 2-3 word label.{tag_avoid}
-- 'message': 1-2 sentences. 'subMessage': one short gentle line.
-- 'youtubeVideoId': 11-character ID of a real, well-known, long-lived, embeddable YouTube video that is calming or gently funny (lo-fi/ambient streams, cozy rain or fireplace, cute animals, gentle nature, harmless classics). All different. Only IDs you are confident are real.{video_avoid}
-- 'videoCaption': one short line about why this clip is nice to put on.
-- 'fact': one simple, wholesome, surprising fact about animals, space, nature or science, in one sentence. Only facts you are certain are true.
-
-Variety seed {random.randint(1000, 9999)}. Return a JSON array of exactly {n} objects."""
-
-
-def fetch_giphy_gif(query):
-    """Random G-rated GIF for a search phrase. Needs GIPHY_API_KEY; returns "" on any problem."""
-    if not GIPHY_API_KEY or not query:
-        return ""
-    for offset in (random.randint(0, 40), 0):
-        url = "https://api.giphy.com/v1/gifs/search?" + urllib.parse.urlencode(
-            {"api_key": GIPHY_API_KEY, "q": query[:80], "limit": 25, "offset": offset,
-             "rating": "g", "lang": "en"})
-        try:
-            with urllib.request.urlopen(url, timeout=6) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            urls = []
-            for g in data.get("data", []):
-                u = ((g.get("images") or {}).get("fixed_height") or {}).get("url", "")
-                if isinstance(u, str) and u.startswith("https://") and ".giphy.com/" in u:
-                    urls.append(u)
-            if urls:
-                return random.choice(urls)
-        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-            return ""
-    return ""
-
-
-def clean_items(raw_items):
-    """Validate shape and verify each video with YouTube (in parallel)."""
-    fields = ("tag", "message", "subMessage", "youtubeVideoId", "videoCaption", "fact")
-    items = []
-    for raw in raw_items:
-        if not isinstance(raw, dict):
-            continue
-        item = {k: str(raw.get(k, "") or "").strip() for k in fields}
-        if item["message"] and item["tag"]:
-            items.append(item)
-    if not items:
-        return items
-    seen_ids = set(read_seen().get("videos", [])[-60:])
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        ok = list(pool.map(lambda it: youtube_is_playable(it["youtubeVideoId"]), items))
-    used = set()
-    for item, good in zip(items, ok):
-        vid = item["youtubeVideoId"] if good else ""
-        if vid in used or vid in seen_ids:
-            vid = ""
-        if vid:
-            used.add(vid)
-        item["youtubeVideoId"] = vid      # the page skips empty ones
-    return items
-
-
-def make_batch(n):
-    """One small, fast Gemini call. Returns (items, model). Raises on failure."""
-    if not GENAI_AVAILABLE:
-        raise RuntimeError("google-genai is not installed. Run: pip install -U google-genai")
-    if not env("GEMINI_API_KEY"):
-        raise RuntimeError("GEMINI_API_KEY is missing. Put it in the .env file next to app.py.")
-    client = make_client(timeout=PACK_HTTP_TIMEOUT_SECONDS)
-    prompt = build_batch_prompt(n)
-    deadline = time.time() + PACK_DEADLINE_SECONDS
-
-    def cfg(fast):
-        extra = {"thinking_config": types.ThinkingConfig(thinking_budget=0)} if fast else {}
-        return types.GenerateContentConfig(
-            response_mime_type="application/json", response_schema=list[DailyItem],
-            temperature=1.0, max_output_tokens=1800, **extra)
-
-    try:   # fast path: no "thinking"
-        response, model, _ = call_gemini(client, max_rounds=PACK_RETRY_ROUNDS, deadline=deadline,
-                                         contents=prompt, config=cfg(True))
-    except RuntimeError:
-        if time.time() > deadline - 10:
-            raise
-        response, model, _ = call_gemini(client, max_rounds=1, deadline=deadline,
-                                         contents=prompt, config=cfg(False))
-    items = clean_items(parse_json_array(response.text))
-    if not items:
-        raise RuntimeError(f"Gemini ({model}) returned no usable items.")
-    write_seen(items)
-    print(f"[Feed] +{len(items)} items from {model}")
-    return items, model
-
-
-# ==============================================================================
-# LIVE FEED: a small buffer of fresh Gemini items, refilled in the background
-# ==============================================================================
-
-FEED_TARGET = 12     # keep about this many items ready
-FEED_BATCH = 5       # items per Gemini call (small = fast)
-_feed = deque()
-_feed_cond = threading.Condition()
-_feed_state = {"error": None, "model": None}
-
-
-def _feed_loop():
-    backoff = 5
-    while True:
-        with _feed_cond:
-            need = len(_feed) < FEED_TARGET
-        if not need:
-            time.sleep(1)
-            continue
-        try:
-            items, model = make_batch(FEED_BATCH)
-            with _feed_cond:
-                _feed.extend(items)
-                _feed_state.update(error=None, model=model)
-                _feed_cond.notify_all()
-            backoff = 5
-        except Exception as exc:  # noqa: BLE001
-            with _feed_cond:
-                _feed_state["error"] = short(exc, 300)
-                _feed_cond.notify_all()
-            print(f"[Feed] {short(exc, 200)}")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 120)
-
-
-def take_feed(n, wait=0):
-    """Hand out up to n fresh items. Waits up to `wait` seconds if the feed is empty."""
-    end = time.time() + wait
-    with _feed_cond:
-        while not _feed and wait and _feed_state["error"] is None:
-            left = end - time.time()
-            if left <= 0:
+            code = getattr(exc, "code", None)
+            errors[model] = short(exc)
+            print(f"[Gemini] {model} failed ({code}): {short(exc, 300)}")
+            if code in (400, 401, 403) and re.search(r"API key|API_KEY|permission|PERMISSION", str(exc)):
                 break
-            _feed_cond.wait(left)
-        out = []
-        while _feed and len(out) < n:
-            out.append(_feed.popleft())
-        return out
+    raise RuntimeError("All Gemini models failed. " + "; ".join(f"{m}: {e}" for m, e in errors.items()))
 
-
-_prewarm_started = False
-
-
-def _ensure_feed_thread():
-    global _prewarm_started
-    if _prewarm_started or not GENAI_AVAILABLE or not env("GEMINI_API_KEY"):
-        return
-    _prewarm_started = True
-    threading.Thread(target=_feed_loop, name="feed", daemon=True).start()
-
-
-def start_prewarm():
-    if env("PREWARM", "1") == "1":
-        _ensure_feed_thread()
-
-
-# ==============================================================================
-# CHAT
-# ==============================================================================
 
 def chat_system_prompt():
     who = FRIEND_NAME or "a friend"
@@ -698,9 +615,9 @@ def generate_chat_reply(msgs):
         raise RuntimeError("google-genai is not installed.")
     if not env("GEMINI_API_KEY"):
         raise RuntimeError("GEMINI_API_KEY is missing.")
-    client = make_client()
+    client = make_client(timeout=CHAT_HTTP_TIMEOUT_SECONDS)
     contents = [types.Content(role=m["role"], parts=[types.Part(text=m["text"])]) for m in msgs]
-    response, model, _ = call_gemini(
+    response, model = call_gemini(
         client,
         contents=contents,
         config=types.GenerateContentConfig(
@@ -721,20 +638,6 @@ def generate_chat_reply(msgs):
 # ==============================================================================
 # API ROUTES
 # ==============================================================================
-
-@app.route("/api/next")
-def api_next():
-    """Fresh Gemini items, each handed out once. The feed refills itself in the background."""
-    _ensure_feed_thread()
-    n = max(1, min(8, request.args.get("n", 4, type=int) or 4))
-    items = take_feed(n, wait=6)
-    with _feed_cond:
-        info = {"items": items, "model": _feed_state["model"], "ready": len(_feed),
-                "error": None if items else (_feed_state["error"] or "Gemini is still warming up.")}
-    resp = jsonify(info)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
 
 @app.route("/api/hug")
 def api_hug():
@@ -945,7 +848,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 items-stretch">
                     <div class="paint-selection-box p-3 flex flex-col justify-between">
-                        <span class="text-[11px] font-bold bg-[#000080] text-white px-2 py-0.5 w-max">pasted_meme.bmp</span>
+                        <div class="flex items-center justify-between gap-2">
+                            <span class="text-[11px] font-bold bg-[#000080] text-white px-2 py-0.5 w-max">pasted_meme.bmp</span>
+                            <button onclick="newMemeOnly()" class="win-btn px-2 py-0.5 text-[11px] font-bold whitespace-nowrap">Next meme ↻</button>
+                        </div>
                         <div id="memeIllustration" class="w-full aspect-video flex items-center justify-center bg-[#fafafa] border border-gray-200 overflow-hidden my-2"></div>
                         <p id="memeCaption" class="paint-handwriting text-sm text-center text-black font-bold"></p>
                     </div>
@@ -967,14 +873,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
 
                 <div class="paint-selection-box p-3 selectable">
-                    <span class="text-[11px] font-bold bg-[#000080] text-white px-2 py-0.5">did_you_know.txt</span>
+                    <div class="flex items-center justify-between gap-2">
+                        <span class="text-[11px] font-bold bg-[#000080] text-white px-2 py-0.5">did_you_know.txt</span>
+                        <button onclick="newFactOnly()" class="win-btn px-2 py-0.5 text-[11px] font-bold whitespace-nowrap">Next fact ↻</button>
+                    </div>
                     <p id="factText" class="paint-handwriting text-sm text-black mt-2"></p>
                 </div>
             </div>
 
             <div class="px-1.5 pb-1.5">
                 <div class="win-well flex items-center gap-2 px-2 py-1 flex-wrap">
-                    <button id="aiBadge" onclick="badgeClicked()" class="bg-[#b58900] text-white px-2 py-0.5 text-xs font-bold cursor-pointer">🟡 Loading…</button>
+                    <button id="aiBadge" onclick="badgeClicked()" class="bg-[#008000] text-white px-2 py-0.5 text-xs font-bold cursor-pointer"></button>
                 </div>
             </div>
         </section>
@@ -1184,19 +1093,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <script>
         const HUGS = {{ hugs | tojson }};          // built-in fallback only; real hugs come from /api/hug
         const FACTS = {{ facts | tojson }};
-        const LOCAL_NOTES = {{ notes | tojson }};
-        const LOCAL_VIDEOS = {{ videos | tojson }};
+        const NOTES = {{ notes | tojson }};
+        const VIDEOS = {{ videos | tojson }};
+        const MEME_LINES = {{ meme_lines | tojson }};
         const BOT_NAME = {{ bot_name | tojson }};
         const CHAT_ENABLED = {{ chat_enabled | tojson }};
-        // Filled in by the server when today's pack is already cached => instant first paint.
-        const INITIAL_PACK = {{ initial_pack | tojson }};
-        const VIDEO_ID_RE = /^[a-zA-Z0-9_-]{11}$/;
 
-        let notePool = [...LOCAL_NOTES], videoPool = [...LOCAL_VIDEOS];
-        let nextNote, nextVideo, nextFact;
-        let lastApiError = null;
-
-        /* ================= shuffled "decks" so the same card never repeats back-to-back ================= */
+        /* ================= shuffled "decks": every card shows once before any repeats ================= */
         function makeDeck(n) {
             let order = [], last = -1;
             return () => {
@@ -1210,12 +1113,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return last;
             };
         }
-        function rebuildDecks() {
-            nextNote = makeDeck(notePool.length);
-            nextVideo = makeDeck(videoPool.length);
-        }
-        rebuildDecks();
-        nextFact = makeDeck(FACTS.length);
+        const nextNote = makeDeck(NOTES.length);
+        const nextVideo = makeDeck(VIDEOS.length);
+        const nextFact = makeDeck(FACTS.length);
+        const nextMemeLine = makeDeck(MEME_LINES.length);
 
         /* ================= window manager (minimise, focus, drag) ================= */
         let zTop = 10;
@@ -1700,31 +1601,43 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             sun: c => [...Array(8).keys()].map(i => {
                 const a = i * Math.PI / 4;
                 return `<line x1="${80 + Math.cos(a) * 40}" y1="${80 + Math.sin(a) * 40}" x2="${80 + Math.cos(a) * 60}" y2="${80 + Math.sin(a) * 60}" ${OUT}/>`;
-            }).join("") + `<circle cx="80" cy="80" r="30" fill="${c}" ${OUT}/><path d="M68 78 Q73 84 78 78 M84 78 Q89 84 94 78" fill="none" ${OUT}/>`
+            }).join("") + `<circle cx="80" cy="80" r="30" fill="${c}" ${OUT}/><path d="M68 78 Q73 84 78 78 M84 78 Q89 84 94 78" fill="none" ${OUT}/>`,
+            pizza: c => `<path d="M80 142 L26 46 Q80 18 134 46 Z" fill="#ffd166" ${OUT}/><circle cx="62" cy="62" r="8" fill="#e63946" ${OUT}/><circle cx="98" cy="66" r="8" fill="#e63946" ${OUT}/><circle cx="80" cy="94" r="8" fill="#e63946" ${OUT}/><path d="M68 112 Q80 120 92 112" fill="none" ${OUT}/>`,
+            cactus: c => `<rect x="32" y="64" width="24" height="48" rx="12" fill="${c}" ${OUT}/><rect x="104" y="50" width="24" height="48" rx="12" fill="${c}" ${OUT}/><rect x="56" y="100" width="48" height="12" fill="${c}"/><rect x="58" y="30" width="44" height="100" rx="22" fill="${c}" ${OUT}/><circle cx="72" cy="70" r="3.5" fill="#000"/><circle cx="88" cy="70" r="3.5" fill="#000"/><path d="M74 82 Q80 88 86 82" fill="none" ${OUT}/><path d="M50 128 L58 148 L102 148 L110 128 Z" fill="#c1693c" ${OUT}/>`,
+            ghost: () => `<path d="M34 138 L34 70 Q34 22 80 22 Q126 22 126 70 L126 138 L106 122 L93 138 L80 122 L67 138 L54 122 Z" fill="#fff" ${OUT}/><circle cx="64" cy="70" r="5" fill="#000"/><circle cx="96" cy="70" r="5" fill="#000"/><ellipse cx="80" cy="92" rx="7" ry="9" fill="#000"/>`,
+            fish: c => `<ellipse cx="68" cy="80" rx="46" ry="32" fill="${c}" ${OUT}/><path d="M110 80 L148 54 L148 106 Z" fill="${c}" ${OUT}/><circle cx="46" cy="72" r="4" fill="#000"/><path d="M32 90 Q42 98 52 90" fill="none" ${OUT}/><path d="M66 60 Q76 80 66 100" fill="none" ${OUT}/>`
         };
         const DOODLE_CAPTIONS = {
-            cloud: ["*a cloud that decided to stay in today*", "*soft cloud, zero deadlines*"],
-            heart: ["*a wobbly heart, drawn with love*", "*heart.exe is running quietly*"],
-            mug: ["*a very serious cup of tea*", "*warm mug, warm thoughts*"],
-            moon: ["*sleepy moon, 11/10 would nap with*", "*the moon says it's okay to rest*"],
-            plant: ["*tiny plant, big dreams*", "*grows slowly, still counts*"],
-            cat: ["*a cat who approves of you*", "*a cat doing absolutely nothing*"],
-            potato: ["*a potato having a great day*", "*potato says hi*"],
-            battery: ["*battery at 20%, still working*", "*charging, please wait*"],
-            star: ["*one small star, just for you*", "*gold star for existing*"],
-            sun: ["*a sun that tries its best*", "*sun peeking through, no rush*"]
+            cloud: ["*a cloud that decided to stay in today*", "*soft cloud, zero deadlines*", "*cloud.exe has stopped responding (it's fine)*"],
+            heart: ["*a wobbly heart, drawn with love*", "*heart.exe is running quietly*", "*a heart, slightly lopsided, fully sincere*"],
+            mug: ["*a very serious cup of tea*", "*warm mug, warm thoughts*", "*mug: hold me, i'm warm*"],
+            moon: ["*sleepy moon, 11/10 would nap with*", "*the moon says it's okay to rest*", "*moon, clocking out for the night*"],
+            plant: ["*tiny plant, big dreams*", "*grows slowly, still counts*", "*one plant. no pressure. just growing.*"],
+            cat: ["*a cat who approves of you*", "*a cat doing absolutely nothing*", "*cat has seen your day and is proud*"],
+            potato: ["*a potato having a great day*", "*potato says hi*", "*potato: i'm just happy to be here*"],
+            battery: ["*battery at 20%, still working*", "*charging, please wait*", "*low battery, high heart*"],
+            star: ["*one small star, just for you*", "*gold star for existing*", "*star: shining at 30% brightness today*"],
+            sun: ["*a sun that tries its best*", "*sun peeking through, no rush*", "*sun, but make it sleepy*"],
+            pizza: ["*a slice of 'it's going to be fine'*", "*pizza: hug in triangle form*"],
+            cactus: ["*a cactus who wants a hug (carefully)*", "*prickly outside, soft inside*"],
+            ghost: ["*boo. (it's a friendly one)*", "*a ghost who just wants to chill*"],
+            fish: ["*a fish. just vibing.*", "*fish says: keep swimming, slowly*"]
         };
         const MEME_CAPTIONS = {
-            cloud: ["my brain today: soft and foggy, and that's allowed", "cloud brain, but it's a soft cloud"],
-            heart: ["me forcing my brain to accept one (1) nice thought", "heart: still beating. that's the whole job today"],
-            mug: ["step one of any plan: tea", "tea first, feelings later"],
-            moon: ["bedtime is my whole personality", "the moon clocked out early and so can i"],
-            plant: ["growing at my own speed (very slow, very fine)", "tiny plant energy today"],
-            cat: ["me, after doing one (1) thing", "cat logic: if it fits, i rest"],
-            potato: ["just a potato. no expectations.", "me being a potato on the couch, proudly"],
-            battery: ["social battery: recharging is a valid hobby", "battery low. blanket mode on"],
-            star: ["i did a thing. give me a star.", "tiny win unlocked"],
-            sun: ["the sun showed up, so maybe i will, a bit later", "sun: trying. me: also trying"]
+            cloud: ["my brain today: soft and foggy, and that's allowed", "cloud brain, but it's a soft cloud", "i'm not sad, i'm just partly cloudy", "weather report: fluffy with a chance of nap", "no thoughts, just cloud", "me, drifting through the day at cloud speed"],
+            heart: ["me forcing my brain to accept one (1) nice thought", "heart: still beating. that's the whole job today", "please handle with care. also with snacks", "my heart is 90% soft, 10% sarcasm", "love is just a heart doing overtime", "heart.exe has not crashed, so we're winning"],
+            mug: ["step one of any plan: tea", "tea first, feelings later", "my mug understands me better than most meetings", "emotional support mug, reporting for duty", "it's not coffee o'clock, it's survival o'clock", "a hot drink is a hug you can hold"],
+            moon: ["bedtime is my whole personality", "the moon clocked out early and so can i", "moon: shines at night, naps all day. i respect that", "night mode: activated, brain: unavailable", "the moon doesn't explain itself either", "just a moon taking a very long break"],
+            plant: ["growing at my own speed (very slow, very fine)", "tiny plant energy today", "i'm a plant. water me and don't expect conversation", "photosynthesis: the original 'sit by a window'", "plant parent in training. also plant child in training", "slow growth is still growth"],
+            cat: ["me, after doing one (1) thing", "cat logic: if it fits, i rest", "this cat has no responsibilities and neither do i today", "cats nap all day and are considered majestic. i'm just saying", "the cat doesn't answer emails and neither will i", "cat: i do what i want. me: same, but sleepier"],
+            potato: ["just a potato. no expectations.", "me being a potato on the couch, proudly", "a potato has never been told to 'try harder'", "today i am a potato. peel back nothing", "potato mode: engaged. do not mash me", "mashed, fried or boiled, a potato is still a win"],
+            battery: ["social battery: recharging is a valid hobby", "battery low. blanket mode on", "i'm at 12% and i've just seen a plug socket. relief", "do not disturb, charging", "my battery percentage and my motivation are in a relationship", "20% still counts as a working device"],
+            star: ["i did a thing. give me a star.", "tiny win unlocked", "gold star for drinking water. i'll accept it", "stars don't try to be anything but stars. neither should i", "five stars for existing today", "achievement unlocked: got out of bed (sort of)"],
+            sun: ["the sun showed up, so maybe i will, a bit later", "sun: trying. me: also trying", "even the sun takes the night off", "looking up at the sun like: yeah, same energy", "good morning to everyone except my alarm", "sun's out, brain's out (to lunch)"],
+            pizza: ["pizza is just a hug you can eat", "my love language is a very large pizza", "i don't need a plan, i need a slice", "life is hard, pizza is a triangle of comfort", "me and pizza: it's complicated (i always say yes)", "one slice of normality, please"],
+            cactus: ["i'm a cactus: low maintenance, a bit prickly, still lovable", "water me once a month and don't ask questions", "prickly outside, soft thoughts inside", "cactus: survives anything, still needs a hug (from a distance)", "me, at a party: standing very still like a cactus", "i thrive on neglect and sunshine"],
+            ghost: ["i'm not antisocial, i'm just haunting my own couch", "ghosting my to-do list", "boo. i mean: hi. please leave a message", "me avoiding responsibilities: 👻", "just a ghost haunting my own bedroom", "being invisible is my superpower today"],
+            fish: ["just keep swimming. slowly. with a snack.", "fish don't have inbox zero and they're fine", "me, floating through the week", "swimming in thoughts, drowning in tabs", "fish: no pockets, no stress", "i'm here, i'm swimming, that's all i've got"]
         };
         const pick = arr => arr[Math.floor(Math.random() * arr.length)];
         function makeDoodle() {
@@ -1733,27 +1646,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         function makeMeme() {
             const k = pick(Object.keys(ICONS));
+            const caption = Math.random() < 0.55 ? pick(MEME_CAPTIONS[k]) : MEME_LINES[nextMemeLine()];
             const fig = `<circle cx="46" cy="52" r="14" fill="#fff" ${OUT}/><circle cx="50" cy="50" r="2" fill="#000"/><path d="M46 66 L46 102 L34 128 M46 102 L58 128 M46 78 L92 66" fill="none" ${OUT}/>`;
             return {
-                caption: pick(MEME_CAPTIONS[k]),
+                caption,
                 svg: `<svg viewBox="0 0 260 140" class="w-full h-full">${fig}<svg x="104" y="8" width="124" height="124" viewBox="0 0 160 160">${ICONS[k](pick(ICON_COLORS))}</svg></svg>`
             };
         }
 
-        /* ================= CARE WINDOW CONTENT ================= */
+        /* ================= CARE WINDOW CONTENT (all local, no AI) ================= */
+        function setMeme() {
+            const meme = makeMeme();
+            document.getElementById("memeIllustration").innerHTML = meme.svg;
+            document.getElementById("memeCaption").textContent = meme.caption;
+        }
+        function setFact() { document.getElementById("factText").textContent = FACTS[nextFact()]; }
+        function setVideo(vid) {
+            document.getElementById("videoHeaderTitle").textContent = vid.title || "clip.avi";
+            document.getElementById("videoCaption").textContent = vid.caption || "Comfort video";
+            document.getElementById("comfortVideoFrame").src = `https://www.youtube-nocookie.com/embed/${vid.id}?rel=0`;
+            document.getElementById("videoExternalLink").href = `https://www.youtube.com/watch?v=${vid.id}`;
+        }
         function applyNewCard() {
-            const note = noteQ.shift() || notePool[nextNote()];
-            const doodle = makeDoodle(), meme = makeMeme();
+            const note = NOTES[nextNote()];
+            const doodle = makeDoodle();
             document.getElementById("noteTag").textContent = note.tag || "Daily Reminder";
             document.getElementById("supportMessage").textContent = note.message;
             document.getElementById("subMessage").textContent = note.subMessage || "";
             document.getElementById("doodleSvgContainer").innerHTML = doodle.svg;
             document.getElementById("doodleCaption").textContent = doodle.caption;
-            document.getElementById("memeIllustration").innerHTML = meme.svg;
-            document.getElementById("memeCaption").textContent = meme.caption;
-            document.getElementById("factText").textContent = factQ.shift() || FACTS[nextFact()];
-            setVideo(videoQ.shift() || videoPool[nextVideo()]);
-            topUpFeed(); updateBadge();
+            setMeme(); setFact();
+            setVideo(VIDEOS[nextVideo()]);
         }
         function renderNew(instant) {
             if (instant) { applyNewCard(); return; }
@@ -1762,46 +1685,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             setTimeout(() => { applyNewCard(); body.classList.remove("fade"); }, 150);
         }
         function loadNewDoodle() { renderNew(false); }
-
-        function setVideo(vid) {
-            document.getElementById("videoHeaderTitle").textContent = vid.title || "clip.avi";
-            document.getElementById("videoCaption").textContent = vid.caption || "Comfort video";
-            document.getElementById("comfortVideoFrame").src = `https://www.youtube-nocookie.com/embed/${vid.id}?rel=0`;
-            document.getElementById("videoExternalLink").href = `https://www.youtube.com/watch?v=${vid.id}`;
-        }
-        function cycleVideoOnly() { setVideo(videoQ.shift() || videoPool[nextVideo()]); topUpFeed(); }
-
-        /* ================= LIVE FEED: fresh Gemini items pulled continuously ================= */
-        const noteQ = [], videoQ = [], factQ = [];
-        let feedBusy = false, feedFails = 0, videoCount = 0;
-
-        function addFeed(items) {
-            items.forEach(it => {
-                if (it.message) noteQ.push({ tag: it.tag, message: it.message, subMessage: it.subMessage });
-                const id = (it.youtubeVideoId || "").trim();
-                if (VIDEO_ID_RE.test(id)) videoQ.push({ id, title: `live_clip_${String(++videoCount).padStart(2, "0")}.avi`, caption: it.videoCaption || "A comfort clip" });
-                if (it.fact) factQ.push(it.fact);
-            });
-        }
-        async function refillFeed() {
-            if (feedBusy) return;
-            feedBusy = true;
-            try {
-                const res = await fetch("/api/next?n=5", { cache: "no-store" });
-                const data = await res.json();
-                if (data.items && data.items.length) { addFeed(data.items); feedFails = 0; }
-                else throw new Error(data.error || "Gemini returned nothing.");
-            } catch (e) { feedFails++; lastApiError = String(e.message || e); }
-            feedBusy = false;
-            updateBadge();
-            if (feedFails && feedFails < 6) setTimeout(topUpFeed, Math.min(60000, 8000 * feedFails));
-        }
-        function topUpFeed() { if (noteQ.length < 4 || videoQ.length < 4 || factQ.length < 4) refillFeed(); }
-        function updateBadge() {
-            if (noteQ.length) setBadge(`🟢 Live from Gemini · ${noteQ.length} fresh notes ready`, "#008000");
-            else if (feedFails) setBadge("🟡 Gemini is busy: showing built-in content. Click for details", "#b58900");
-            else setBadge("🟡 Fetching fresh content…", "#b58900");
-        }
+        function cycleVideoOnly() { setVideo(VIDEOS[nextVideo()]); }
+        function newMemeOnly() { setMeme(); }
+        function newFactOnly() { setFact(); }
 
         /* ================= menus & modals ================= */
         function toggleMenu(id) {
@@ -1856,7 +1742,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         });
 
-        /* ================= CHAT ================= */
+        /* ================= CHAT (the only part that talks to Gemini) ================= */
         const CHAT_KEY = "paintcare_chat_v1";
         const CHAT_OFFLINE = [
             "my wifi just tripped over a cable. i'm still here though, being a small and loyal pixel.",
@@ -1945,11 +1831,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         /* ================= status badge ================= */
-        function setBadge(text, bg) {
-            const b = document.getElementById("aiBadge"); b.textContent = text; b.style.backgroundColor = bg;
+        function badgeText() {
+            return `📚 ${NOTES.length} notes · ${VIDEOS.length} videos · ${FACTS.length} facts · ${MEME_LINES.length}+ memes`;
         }
+        document.getElementById("aiBadge").textContent = badgeText();
         function badgeClicked() {
-            showInfoModal(lastApiError || "Everything is running normally.");
+            showInfoModal(badgeText() + "\n\nAll of this is stored locally in app.py (or my_content.json), so it's instant and never repeats until the whole list has been shown." + (CHAT_ENABLED ? "\n\nOnly the chat window uses Gemini." : ""));
         }
 
         /* ================= HUG COUNTER (stored only in this browser) ================= */
@@ -2014,7 +1901,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         /* ================= STARTUP ================= */
         renderHugCount(); loadChecklist();
-        if (INITIAL_PACK && INITIAL_PACK.items) addFeed(INITIAL_PACK.items);
         renderNew(true);
     </script>
 </body>
@@ -2024,25 +1910,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 @app.route("/")
 def index():
-    items = take_feed(3, 0)          # fresh items baked into the page if any are ready
     return render_template_string(
         HTML_TEMPLATE,
         hugs=HUG_GIFS,
         facts=FACTS,
         notes=SUPPORT_NOTES,
         videos=COMFORT_VIDEOS,
+        meme_lines=MEME_LINES,
         friend_name=FRIEND_NAME,
         sender_name=SENDER_NAME,
         bot_name=BOT_NAME,
         chat_enabled=ENABLE_CHAT,
-        initial_pack={"items": items} if items else None,
     )
 
 
-start_prewarm()
+load_extras()
+if env("VERIFY_VIDEOS", "1") == "1":
+    verify_videos_in_background()
 
 if __name__ == "__main__":
-    print(f"[Startup] Gemini models (in order): {', '.join(GEMINI_MODELS)}")
+    print(f"[Startup] Notes: {len(SUPPORT_NOTES)} | Facts: {len(FACTS)} | Videos: {len(COMFORT_VIDEOS)} | Meme lines: {len(MEME_LINES)}")
+    print(f"[Startup] Gemini (chat only) models: {', '.join(GEMINI_MODELS)}")
     print(f"[Startup] API key present: {bool(env('GEMINI_API_KEY'))} | Giphy key present: {bool(GIPHY_API_KEY)}")
-    print(f"[Startup] Chat: {'on' if ENABLE_CHAT else 'off'} | Prewarm: {'on' if _prewarm_started else 'off'}")
+    print(f"[Startup] Chat: {'on' if ENABLE_CHAT else 'off'}")
     app.run(host="0.0.0.0", port=int(env("PORT", "5000")), debug=False)
