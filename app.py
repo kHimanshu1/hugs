@@ -6,14 +6,12 @@ A retro Windows-style desktop with separate windows:
   * Chat       : a goofy little chatbot that gives funny, soft replies
   * Paint      : a real drawing window (pencil, brush, spray, fill, shapes, stamps...)
 
-Gemini is used for only three things:
-  1. 10 gentle daily notes        (cached once per day)
-  2. 10 YouTube recommendations   (cached once per day, each checked with YouTube)
-  3. the chatbot's replies
-
-Doodles and memes are generated instantly in the browser (no AI, no waiting).
-Hug GIFs are NOT cached: every click on the hug button asks Giphy for a fresh random hug.
-Random facts come from a curated built-in list and change with the "New Page" button.
+Gemini is used for three things, all LIVE (nothing is cached per day):
+  1. gentle notes + comfort-video picks + a fun fact, in small fast batches
+  2. the chatbot's replies
+A background thread keeps a small "feed" of fresh items ready, so every click on
+"New Page" gets brand-new Gemini content instantly, and the feed refills itself.
+Doodles and memes are generated in the browser. Hug GIFs come live from Giphy.
 
 Run:
     pip install -r requirements.txt
@@ -103,15 +101,19 @@ FAILURE_COOLDOWN_SECONDS = 60
 CHAT_FAILURE_COOLDOWN_SECONDS = 30
 
 try:
-    PACK_RETRY_ROUNDS = max(1, int(env("GEMINI_RETRIES", "4") or 4))
+    PACK_RETRY_ROUNDS = max(1, int(env("GEMINI_RETRIES", "2") or 2))
 except ValueError:
-    PACK_RETRY_ROUNDS = 4
-PACK_DEADLINE_SECONDS = 90       # stop retrying after this long
-PACK_HTTP_TIMEOUT_SECONDS = 45   # one request taking longer than this is retried
+    PACK_RETRY_ROUNDS = 2
+PACK_DEADLINE_SECONDS = 60       # stop retrying after this long
+PACK_HTTP_TIMEOUT_SECONDS = 25   # one request taking longer than this is retried
 
 _gen_lock = threading.Lock()
 _last_failure = {"time": 0.0, "error": None}
-_good_model = {"name": None}
+_GOOD_MODEL_FILE = BASE_DIR / ".good_model"
+try:
+    _good_model = {"name": _GOOD_MODEL_FILE.read_text(encoding="utf-8").strip() or None}
+except OSError:
+    _good_model = {"name": None}
 _chat_failure = {"time": 0.0}
 _chat_pool = ThreadPoolExecutor(max_workers=4)
 CHAT_TIMEOUT_SECONDS = 15
@@ -302,6 +304,7 @@ if GENAI_AVAILABLE:
         subMessage: str
         youtubeVideoId: str
         videoCaption: str
+        fact: str
 
 
 def short(text, limit=220):
@@ -354,7 +357,12 @@ def call_gemini(client, on_status=None, max_rounds=1, deadline=None, **kwargs):
                 try:
                     response = client.models.generate_content(model=model, **kwargs)
                     attempts.append({"model": model, "ok": True})
-                    _good_model["name"] = model
+                    if _good_model["name"] != model:
+                        _good_model["name"] = model
+                        try:
+                            _GOOD_MODEL_FILE.write_text(model, encoding="utf-8")
+                        except OSError:
+                            pass
                     return response, model
                 except Exception as exc:  # noqa: BLE001
                     code = getattr(exc, "code", None)
@@ -454,29 +462,29 @@ def write_seen(items):
         print(f"[Seen] Could not write: {exc}")
 
 
-def build_prompt():
+def build_batch_prompt(n):
     who = f"my friend {FRIEND_NAME}" if FRIEND_NAME else "a close friend"
     where = f" who lives in {FRIEND_COUNTRY}" if FRIEND_COUNTRY else " who lives in another country"
     sender = f" The notes are from {SENDER_NAME}." if SENDER_NAME else ""
     seen = read_seen()
     avoid_videos = ", ".join(seen.get("videos", [])[-40:])
     avoid_tags = ", ".join(seen.get("tags", [])[-30:])
-    video_avoid = f" Do NOT use any of these IDs again: {avoid_videos}." if avoid_videos else ""
+    video_avoid = f" Do NOT use any of these IDs: {avoid_videos}." if avoid_videos else ""
     tag_avoid = f" Avoid these recent tags: {avoid_tags}." if avoid_tags else ""
-    return f"""Write 10 unique, warm, gentle daily care notes for {who}{where}, who is going through depression.{sender}
+    return f"""Write {n} unique, warm, gentle care items for {who}{where}, who is going through depression.{sender}
 
 Rules:
 - Zero pressure: never ask them to reply, never give orders, no "you should".
 - No toxic positivity, no "just think positive", no "everything happens for a reason".
 - No medical advice, no mention of self-harm or suicide.
-- Short and human. Light, soft humour is welcome. Each item must feel different from the others.
+- Short and human. Light, soft humour is welcome. Each item must feel different.
 - 'tag': 2-3 word label.{tag_avoid}
 - 'message': 1-2 sentences. 'subMessage': one short gentle line.
-- 'youtubeVideoId': the 11-character ID of a real, well-known, long-lived, embeddable YouTube video that is calming or gently funny. Make the 10 videos varied: lo-fi or ambient streams, cozy rain or fireplace, cute animals, gentle nature, harmless classic funny clips. Every ID must be different. Only use IDs you are confident are real.{video_avoid}
+- 'youtubeVideoId': 11-character ID of a real, well-known, long-lived, embeddable YouTube video that is calming or gently funny (lo-fi/ambient streams, cozy rain or fireplace, cute animals, gentle nature, harmless classics). All different. Only IDs you are confident are real.{video_avoid}
 - 'videoCaption': one short line about why this clip is nice to put on.
+- 'fact': one simple, wholesome, surprising fact about animals, space, nature or science, in one sentence. Only facts you are certain are true.
 
-Today's date is {date.today().isoformat()}; variety seed {random.randint(1000, 9999)}. Use them only to make the picks different from other days.
-Return a JSON array of exactly 10 objects."""
+Variety seed {random.randint(1000, 9999)}. Return a JSON array of exactly {n} objects."""
 
 
 def fetch_giphy_gif(query):
@@ -503,8 +511,8 @@ def fetch_giphy_gif(query):
 
 
 def clean_items(raw_items):
-    """Validate shape and verify every video with YouTube (in parallel)."""
-    fields = ("tag", "message", "subMessage", "youtubeVideoId", "videoCaption")
+    """Validate shape and verify each video with YouTube (in parallel)."""
+    fields = ("tag", "message", "subMessage", "youtubeVideoId", "videoCaption", "fact")
     items = []
     for raw in raw_items:
         if not isinstance(raw, dict):
@@ -512,160 +520,118 @@ def clean_items(raw_items):
         item = {k: str(raw.get(k, "") or "").strip() for k in fields}
         if item["message"] and item["tag"]:
             items.append(item)
-
-    n = len(items)
-    mark_done("notes", f"{n} notes")
-    if not n:
+    if not items:
         return items
-
-    set_progress(40, "videos", f"Checking video 0 of {n}")
-    ok = [False] * n
-    done = 0
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {pool.submit(youtube_is_playable, it["youtubeVideoId"]): i for i, it in enumerate(items)}
-        for fut in as_completed(futures):
-            try:
-                ok[futures[fut]] = bool(fut.result())
-            except Exception:  # noqa: BLE001
-                ok[futures[fut]] = False
-            done += 1
-            set_progress(40 + 50 * done / n, "videos", f"Checking video {done} of {n}")
-
+    seen_ids = set(read_seen().get("videos", [])[-60:])
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        ok = list(pool.map(lambda it: youtube_is_playable(it["youtubeVideoId"]), items))
     used = set()
     for item, good in zip(items, ok):
         vid = item["youtubeVideoId"] if good else ""
-        if vid in used:
-            vid = ""                      # no duplicate videos in one pack
+        if vid in used or vid in seen_ids:
+            vid = ""
         if vid:
             used.add(vid)
-        item["youtubeVideoId"] = vid      # frontend skips empty ones
-    mark_done("videos", f"{sum(1 for it in items if it['youtubeVideoId'])} of {n} verified")
+        item["youtubeVideoId"] = vid      # the page skips empty ones
     return items
 
 
-def generate_gemini_daily_pack():
-    """Returns (items, model_used). Raises on failure."""
+def make_batch(n):
+    """One small, fast Gemini call. Returns (items, model). Raises on failure."""
     if not GENAI_AVAILABLE:
         raise RuntimeError("google-genai is not installed. Run: pip install -U google-genai")
     if not env("GEMINI_API_KEY"):
         raise RuntimeError("GEMINI_API_KEY is missing. Put it in the .env file next to app.py.")
-
-    set_progress(8, "gemini", "Asking Gemini for today's notes and videos…")
     client = make_client(timeout=PACK_HTTP_TIMEOUT_SECONDS)
-    response, model, _ = call_gemini(
-        client,
-        on_status=lambda text: set_progress(8, "gemini", text),
-        max_rounds=PACK_RETRY_ROUNDS,
-        deadline=time.time() + PACK_DEADLINE_SECONDS,
-        contents=build_prompt(),
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=list[DailyItem],
-            temperature=1.0,
-            max_output_tokens=8000,
-        ),
-    )
-    mark_done("gemini", f"by {model}")
+    prompt = build_batch_prompt(n)
+    deadline = time.time() + PACK_DEADLINE_SECONDS
+
+    def cfg(fast):
+        extra = {"thinking_config": types.ThinkingConfig(thinking_budget=0)} if fast else {}
+        return types.GenerateContentConfig(
+            response_mime_type="application/json", response_schema=list[DailyItem],
+            temperature=1.0, max_output_tokens=1800, **extra)
+
+    try:   # fast path: no "thinking"
+        response, model, _ = call_gemini(client, max_rounds=PACK_RETRY_ROUNDS, deadline=deadline,
+                                         contents=prompt, config=cfg(True))
+    except RuntimeError:
+        if time.time() > deadline - 10:
+            raise
+        response, model, _ = call_gemini(client, max_rounds=1, deadline=deadline,
+                                         contents=prompt, config=cfg(False))
     items = clean_items(parse_json_array(response.text))
-    if len(items) < 3:
-        raise RuntimeError(f"Gemini ({model}) returned too few usable items ({len(items)}).")
-    set_progress(95, "save", "Saving today's pack…")
+    if not items:
+        raise RuntimeError(f"Gemini ({model}) returned no usable items.")
     write_seen(items)
-    print(f"[Gemini] Generated {len(items)} items with {model}")
+    print(f"[Feed] +{len(items)} items from {model}")
     return items, model
 
 
 # ==============================================================================
-# CACHE (one file, atomic writes)
+# LIVE FEED: a small buffer of fresh Gemini items, refilled in the background
 # ==============================================================================
 
-def read_cache(today):
-    try:
-        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-        if data.get("date") == today and data.get("items") and data.get("schema") == CACHE_SCHEMA:
-            return data
-    except (OSError, json.JSONDecodeError):
-        pass
-    return None
+FEED_TARGET = 12     # keep about this many items ready
+FEED_BATCH = 5       # items per Gemini call (small = fast)
+_feed = deque()
+_feed_cond = threading.Condition()
+_feed_state = {"error": None, "model": None}
 
 
-def write_cache(today, items, model):
-    payload = json.dumps({"schema": CACHE_SCHEMA, "date": today, "model": model, "items": items}, ensure_ascii=False, indent=2)
-    fd, tmp_path = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        os.replace(tmp_path, CACHE_FILE)
-    except OSError as exc:
-        print(f"[Cache] Could not write cache: {exc}")
+def _feed_loop():
+    backoff = 5
+    while True:
+        with _feed_cond:
+            need = len(_feed) < FEED_TARGET
+        if not need:
+            time.sleep(1)
+            continue
         try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-
-def _cache_payload(today, cached):
-    return {"date": today, "source": "cache", "model": cached.get("model"), "items": cached["items"]}
-
-
-def _fallback_payload(today, error):
-    return {"date": today, "source": "fallback", "items": [], "error": error}
-
-
-def ensure_daily_pack(force=False, ignore_cooldown=False):
-    """Return today's pack payload (a dict). Never raises."""
-    today = date.today().isoformat()
-    if not force:
-        cached = read_cache(today)
-        if cached:
-            return _cache_payload(today, cached)
-        if (not ignore_cooldown and _last_failure["error"]
-                and time.time() - _last_failure["time"] < FAILURE_COOLDOWN_SECONDS):
-            return _fallback_payload(today, _last_failure["error"])
-
-    with _gen_lock:
-        if not force:
-            cached = read_cache(today)
-            if cached:
-                return _cache_payload(today, cached)
-        _progress.update(running=True, pct=3, stage="start", detail="Starting up…", done={})
-        try:
-            items, model = generate_gemini_daily_pack()
+            items, model = make_batch(FEED_BATCH)
+            with _feed_cond:
+                _feed.extend(items)
+                _feed_state.update(error=None, model=model)
+                _feed_cond.notify_all()
+            backoff = 5
         except Exception as exc:  # noqa: BLE001
-            _last_failure.update(time=time.time(), error=short(exc, 400))
-            _progress.update(running=False, pct=0, stage="idle", detail="", done={})
-            return _fallback_payload(today, _last_failure["error"])
-        _last_failure.update(time=0.0, error=None)
-        write_cache(today, items, model)
-        mark_done("save", "saved")
-        _progress.update(running=False, pct=100, stage="done", detail="")
-    return {"date": today, "source": "gemini", "model": model, "items": items}
+            with _feed_cond:
+                _feed_state["error"] = short(exc, 300)
+                _feed_cond.notify_all()
+            print(f"[Feed] {short(exc, 200)}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+
+
+def take_feed(n, wait=0):
+    """Hand out up to n fresh items. Waits up to `wait` seconds if the feed is empty."""
+    end = time.time() + wait
+    with _feed_cond:
+        while not _feed and wait and _feed_state["error"] is None:
+            left = end - time.time()
+            if left <= 0:
+                break
+            _feed_cond.wait(left)
+        out = []
+        while _feed and len(out) < n:
+            out.append(_feed.popleft())
+        return out
 
 
 _prewarm_started = False
 
 
-def _prewarm_loop():
-    while True:
-        delay = 600
-        try:
-            payload = ensure_daily_pack()
-            if payload.get("source") == "fallback":
-                delay = 120
-        except Exception as exc:  # noqa: BLE001
-            print(f"[Prewarm] {short(exc, 200)}")
-            delay = 120
-        time.sleep(delay)
+def _ensure_feed_thread():
+    global _prewarm_started
+    if _prewarm_started or not GENAI_AVAILABLE or not env("GEMINI_API_KEY"):
+        return
+    _prewarm_started = True
+    threading.Thread(target=_feed_loop, name="feed", daemon=True).start()
 
 
 def start_prewarm():
-    global _prewarm_started
-    if _prewarm_started or env("PREWARM", "1") != "1":
-        return
-    if not GENAI_AVAILABLE or not env("GEMINI_API_KEY"):
-        return
-    _prewarm_started = True
-    threading.Thread(target=_prewarm_loop, name="prewarm", daemon=True).start()
+    if env("PREWARM", "1") == "1":
+        _ensure_feed_thread()
 
 
 # ==============================================================================
@@ -756,23 +722,18 @@ def generate_chat_reply(msgs):
 # API ROUTES
 # ==============================================================================
 
-@app.route("/api/daily-pack")
-def api_daily_pack():
-    today = date.today().isoformat()
-    force = request.args.get("force") == "1"
-    if force and REFRESH_TOKEN and request.args.get("token") != REFRESH_TOKEN:
-        return jsonify(_fallback_payload(today, "Refresh token required.")), 403
-    return jsonify(ensure_daily_pack(force=force, ignore_cooldown=request.args.get("retry") == "1"))
-
-
-@app.route("/api/pack-progress")
-def api_pack_progress():
-    ready = bool(read_cache(date.today().isoformat()))
-    return jsonify({"ready": ready, "running": _progress["running"],
-                    "pct": 100 if ready else _progress["pct"],
-                    "stage": "done" if ready else _progress["stage"],
-                    "detail": "" if ready else _progress.get("detail", ""),
-                    "done": dict(_progress.get("done", {}))})
+@app.route("/api/next")
+def api_next():
+    """Fresh Gemini items, each handed out once. The feed refills itself in the background."""
+    _ensure_feed_thread()
+    n = max(1, min(8, request.args.get("n", 4, type=int) or 4))
+    items = take_feed(n, wait=6)
+    with _feed_cond:
+        info = {"items": items, "model": _feed_state["model"], "ready": len(_feed),
+                "error": None if items else (_feed_state["error"] or "Gemini is still warming up.")}
+    resp = jsonify(info)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/hug")
@@ -1179,36 +1140,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="flex-1"></div>
         <button class="win-btn px-2 h-8 text-[11px] whitespace-nowrap hidden lg:inline-flex" onclick="tidyWindows()" title="Put the windows back where they started">Tidy up</button>
         <div id="clock" class="win-well px-2 py-1 text-xs whitespace-nowrap"></div>
-    </div>
-
-    <!-- LOADING SCREEN (only when today's pack is not cached yet) -->
-    <div id="loadOverlay" class="fixed inset-0 flex items-center justify-center p-4 {% if initial_pack %}hidden{% endif %}" style="z-index:6000;background:#008080">
-        <div class="win-outset w-full max-w-md shadow-2xl">
-            <div class="win-titlebar"><span>Loading today's page…</span></div>
-            <div class="p-4 flex flex-col gap-3 bg-[#c0c0c0]">
-                <div class="flex items-center gap-3">
-                    <span class="text-3xl" aria-hidden="true">💌</span>
-                    <div class="min-w-0">
-                        <p id="loadText" class="text-sm text-black font-bold">Waking up Gemini…</p>
-                        <p id="loadDetail" class="text-xs text-gray-700" aria-live="polite"></p>
-                    </div>
-                </div>
-                <div id="loadBarWrap" class="win-inset h-6 p-0.5" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Loading">
-                    <div id="loadBar" style="height:100%;width:0%;background:repeating-linear-gradient(90deg,#000080 0,#000080 10px,transparent 10px,transparent 12px)"></div>
-                </div>
-                <ul id="loadSteps" class="win-inset p-2 text-xs text-black flex flex-col gap-1"></ul>
-                <div class="flex items-center justify-between">
-                    <span id="loadPct" class="text-xs text-black">0%</span>
-                </div>
-                <div id="loadError" class="hidden flex flex-col gap-2">
-                    <p id="loadErrorText" class="selectable text-xs text-[#800000] break-words"></p>
-                    <div class="flex gap-2 justify-end">
-                        <button onclick="loadChoose('offline')" class="win-btn px-3 py-1 text-xs">Use built-in content</button>
-                        <button onclick="loadChoose('retry')" class="win-btn px-3 py-1 text-xs font-bold">Try again</button>
-                    </div>
-                </div>
-            </div>
-        </div>
     </div>
 
     <!-- INFO MODAL -->
@@ -1811,7 +1742,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         /* ================= CARE WINDOW CONTENT ================= */
         function applyNewCard() {
-            const note = notePool[nextNote()];
+            const note = noteQ.shift() || notePool[nextNote()];
             const doodle = makeDoodle(), meme = makeMeme();
             document.getElementById("noteTag").textContent = note.tag || "Daily Reminder";
             document.getElementById("supportMessage").textContent = note.message;
@@ -1820,8 +1751,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("doodleCaption").textContent = doodle.caption;
             document.getElementById("memeIllustration").innerHTML = meme.svg;
             document.getElementById("memeCaption").textContent = meme.caption;
-            document.getElementById("factText").textContent = FACTS[nextFact()];
-            setVideo(videoPool[nextVideo()]);
+            document.getElementById("factText").textContent = factQ.shift() || FACTS[nextFact()];
+            setVideo(videoQ.shift() || videoPool[nextVideo()]);
+            topUpFeed(); updateBadge();
         }
         function renderNew(instant) {
             if (instant) { applyNewCard(); return; }
@@ -1837,21 +1769,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("comfortVideoFrame").src = `https://www.youtube-nocookie.com/embed/${vid.id}?rel=0`;
             document.getElementById("videoExternalLink").href = `https://www.youtube.com/watch?v=${vid.id}`;
         }
-        function cycleVideoOnly() { setVideo(videoPool[nextVideo()]); }
+        function cycleVideoOnly() { setVideo(videoQ.shift() || videoPool[nextVideo()]); topUpFeed(); }
 
-        /* Gemini supplies only notes and videos. Anything missing falls back to the built-in lists. */
-        function applyPack(data) {
-            if (!data || !Array.isArray(data.items) || !data.items.length) return false;
-            const items = data.items;
-            const notes = items.filter(it => it.message).map(it => ({ tag: it.tag, message: it.message, subMessage: it.subMessage }));
-            const vids = items
-                .filter(it => it.youtubeVideoId && VIDEO_ID_RE.test(it.youtubeVideoId.trim()))
-                .map((it, i) => ({ id: it.youtubeVideoId.trim(), title: `daily_clip_${String(i).padStart(2, "0")}.avi`, caption: it.videoCaption || "A comfort clip" }));
-            notePool = notes.length ? notes : [...LOCAL_NOTES];
-            videoPool = vids.length ? vids : [...LOCAL_VIDEOS];
-            rebuildDecks();
-            setBadge(data.source === "gemini" ? "🟢 Gemini online: fresh daily pack" : "🟢 Today's pack loaded", "#008000");
-            return true;
+        /* ================= LIVE FEED: fresh Gemini items pulled continuously ================= */
+        const noteQ = [], videoQ = [], factQ = [];
+        let feedBusy = false, feedFails = 0, videoCount = 0;
+
+        function addFeed(items) {
+            items.forEach(it => {
+                if (it.message) noteQ.push({ tag: it.tag, message: it.message, subMessage: it.subMessage });
+                const id = (it.youtubeVideoId || "").trim();
+                if (VIDEO_ID_RE.test(id)) videoQ.push({ id, title: `live_clip_${String(++videoCount).padStart(2, "0")}.avi`, caption: it.videoCaption || "A comfort clip" });
+                if (it.fact) factQ.push(it.fact);
+            });
+        }
+        async function refillFeed() {
+            if (feedBusy) return;
+            feedBusy = true;
+            try {
+                const res = await fetch("/api/next?n=5", { cache: "no-store" });
+                const data = await res.json();
+                if (data.items && data.items.length) { addFeed(data.items); feedFails = 0; }
+                else throw new Error(data.error || "Gemini returned nothing.");
+            } catch (e) { feedFails++; lastApiError = String(e.message || e); }
+            feedBusy = false;
+            updateBadge();
+            if (feedFails && feedFails < 6) setTimeout(topUpFeed, Math.min(60000, 8000 * feedFails));
+        }
+        function topUpFeed() { if (noteQ.length < 4 || videoQ.length < 4 || factQ.length < 4) refillFeed(); }
+        function updateBadge() {
+            if (noteQ.length) setBadge(`🟢 Live from Gemini · ${noteQ.length} fresh notes ready`, "#008000");
+            else if (feedFails) setBadge("🟡 Gemini is busy: showing built-in content. Click for details", "#b58900");
+            else setBadge("🟡 Fetching fresh content…", "#b58900");
         }
 
         /* ================= menus & modals ================= */
@@ -2063,172 +2012,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (checklist.date !== todayKey()) { checklist = { date: todayKey() }; saveChecklist(); renderChecklist(); }
         }, 60000);
 
-        /* ================= STARTUP: nothing is shown until everything is loaded ================= */
-        const LOAD_STEPS = [
-            { id: "gemini", doing: "Gemini is writing notes and picking videos", done: "Gemini wrote today's notes" },
-            { id: "notes",  doing: "Sorting the notes",                        done: "Notes ready" },
-            { id: "videos", doing: "Checking the YouTube videos play",         done: "Videos checked" },
-            { id: "save",   doing: "Saving today's pack",                      done: "Pack saved" },
-            { id: "ready",  doing: "Putting the page together",                done: "Page assembled" }
-        ];
-        const STEP_DETAIL = {
-            gemini: "Gemini is writing 10 notes and picking 10 videos. This usually takes a few seconds.",
-            notes: "",
-            videos: "Making sure every video exists and can be embedded…",
-            save: "Almost there…",
-            ready: ""
-        };
-        const LOAD = { target: 3, shown: 0, serverDone: {}, clientDone: {}, activeId: "", activeSince: Date.now() };
-        let loadChoiceResolve = null;
-
-        function loadChoose(choice) {
-            if (loadChoiceResolve) { const r = loadChoiceResolve; loadChoiceResolve = null; r(choice); }
-        }
-        function setLoadDetail(t) {
-            const el = document.getElementById("loadDetail");
-            el.textContent = t || "";
-            el.style.color = /busy|retry|too long/i.test(t || "") ? "#9a5b00" : "";   // amber while Gemini is overloaded
-        }
-        const doneMap = () => ({ ...LOAD.serverDone, ...LOAD.clientDone });
-
-        function renderLoadSteps() {
-            const done = doneMap();
-            const active = LOAD_STEPS.findIndex(s => !(s.id in done));
-            const activeId = active >= 0 ? LOAD_STEPS[active].id : "";
-            if (activeId !== LOAD.activeId) { LOAD.activeId = activeId; LOAD.activeSince = Date.now(); }
-            const secs = Math.floor((Date.now() - LOAD.activeSince) / 1000);
-
-            const ul = document.getElementById("loadSteps");
-            ul.innerHTML = "";
-            LOAD_STEPS.forEach((s, i) => {
-                const li = document.createElement("li");
-                li.style.cssText = "display:flex;gap:6px;align-items:baseline";
-                const icon = document.createElement("span");
-                icon.style.cssText = "width:14px;flex:none;text-align:center;font-weight:bold";
-                const text = document.createElement("span");
-                if (s.id in done) {
-                    const info = done[s.id] || "";
-                    const skipped = info.startsWith("skipped");
-                    icon.textContent = skipped ? "–" : "✔";
-                    icon.style.color = skipped ? "#777" : "#008000";
-                    text.textContent = skipped ? `${s.done} ${info}` : (info ? `${s.done} · ${info}` : s.done);
-                    text.style.color = "#444";
-                } else if (i === active) {
-                    icon.textContent = "▶"; icon.style.color = "#000080";
-                    text.textContent = `${s.doing}… ${secs >= 3 ? "(" + secs + "s)" : ""}`;
-                    text.style.fontWeight = "bold";
-                } else {
-                    icon.textContent = "○"; icon.style.color = "#888";
-                    text.textContent = s.doing; text.style.color = "#888";
-                }
-                li.append(icon, text);
-                ul.appendChild(li);
-            });
-            document.getElementById("loadText").textContent = active >= 0 ? LOAD_STEPS[active].doing + "…" : "All done!";
-        }
-
-        /* Short summaries for every server-side step, worked out from the finished pack. */
-        function summarize(data) {
-            const it = data.items, n = it.length;
-            const vids = it.filter(i => VIDEO_ID_RE.test((i.youtubeVideoId || "").trim())).length;
-            return {
-                gemini: data.model ? `by ${data.model}` : `${n} items`,
-                notes: `${n} notes`,
-                videos: `${vids} of ${n} verified`,
-                save: "saved"
-            };
-        }
-
-        /* One attempt: ask the server, follow its progress. Returns true on success. */
-        async function loadPackOnce(retry) {
-            LOAD.serverDone = {}; LOAD.clientDone = {}; LOAD.target = 3;
-            renderLoadSteps();
-            setLoadDetail(STEP_DETAIL.gemini);
-
-            const poll = setInterval(async () => {
-                try {
-                    const p = await (await fetch("/api/pack-progress")).json();
-                    LOAD.serverDone = p.done || {};
-                    renderLoadSteps();
-                    setLoadDetail(p.detail || STEP_DETAIL[LOAD.activeId] || "");
-                    if (typeof p.pct === "number") LOAD.target = Math.max(LOAD.target, Math.min(p.pct, 96));
-                } catch (e) { /* keep easing */ }
-            }, 500);
-            const tick = setInterval(renderLoadSteps, 1000);   // keeps the "(12s)" counter moving
-
-            const ctrl = new AbortController();
-            const timer = setTimeout(() => ctrl.abort(), 150000);
-            let data;
-            try {
-                const res = await fetch("/api/daily-pack" + (retry ? "?retry=1" : ""), { signal: ctrl.signal });
-                data = await res.json();
-            } catch (e) {
-                data = { items: [], error: e.name === "AbortError" ? "Gemini took too long to answer." : String(e) };
-            }
-            clearTimeout(timer); clearInterval(poll); clearInterval(tick);
-
-            if (!applyPack(data)) {
-                lastApiError = data.error || "Gemini returned no items.";
-                return false;
-            }
-            LOAD.clientDone = summarize(data);
-            LOAD.target = Math.max(LOAD.target, 96);
-            renderLoadSteps();
-            return true;
-        }
-
-        async function runLoader() {
-            const overlay = document.getElementById("loadOverlay");
-            const barEl = document.getElementById("loadBar"), pctEl = document.getElementById("loadPct");
-            const wrap = document.getElementById("loadBarWrap");
-            const errBox = document.getElementById("loadError");
-            renderLoadSteps();
-
-            const paint = setInterval(() => {
-                let t = LOAD.target;
-                if (LOAD.activeId === "gemini") t = Math.max(t, Math.min(35, 12 + (Date.now() - LOAD.activeSince) / 1000 * 1.2));
-                LOAD.shown += (t - LOAD.shown) * 0.2;
-                const v = Math.min(100, Math.round(LOAD.shown));
-                barEl.style.width = v + "%"; pctEl.textContent = v + "%"; wrap.setAttribute("aria-valuenow", v);
-            }, 50);
-
-            let retry = false, useBuiltIn = false;
-            while (true) {
-                errBox.classList.add("hidden");
-                if (await loadPackOnce(retry)) break;
-                LOAD.target = 3; LOAD.shown = 0;
-                setLoadDetail("Stopped.");
-                document.getElementById("loadErrorText").textContent = "Couldn't load today's pack: " + lastApiError;
-                errBox.classList.remove("hidden");
-                const choice = await new Promise(res => { loadChoiceResolve = res; });
-                if (choice === "offline") { useBuiltIn = true; break; }
-                retry = true;
-            }
-            errBox.classList.add("hidden");
-            if (useBuiltIn) {
-                setBadge("🟡 Offline mode (built-in content). Click for details", "#b58900");
-                LOAD_STEPS.forEach(s => { if (!(s.id in doneMap())) LOAD.clientDone[s.id] = "skipped (built-in content)"; });
-            }
-
-            setLoadDetail("");
-            renderLoadSteps();
-            await new Promise(r => setTimeout(r, 300));
-            renderNew(true);                                  // page is fully filled in before the screen lifts
-            LOAD.clientDone.ready = "";
-            LOAD.target = 100;
-            renderLoadSteps();
-            await new Promise(r => setTimeout(r, 700));
-            clearInterval(paint);
-            barEl.style.width = "100%"; pctEl.textContent = "100%";
-            overlay.classList.add("hidden");
-        }
-
+        /* ================= STARTUP ================= */
         renderHugCount(); loadChecklist();
-        if (applyPack(INITIAL_PACK)) {
-            renderNew(true);       // today's pack is cached: no waiting at all
-        } else {
-            runLoader();
-        }
+        if (INITIAL_PACK && INITIAL_PACK.items) addFeed(INITIAL_PACK.items);
+        renderNew(true);
     </script>
 </body>
 </html>
@@ -2237,8 +2024,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 @app.route("/")
 def index():
-    cached = read_cache(date.today().isoformat())
-    initial_pack = _cache_payload(date.today().isoformat(), cached) if cached else None
+    items = take_feed(3, 0)          # fresh items baked into the page if any are ready
     return render_template_string(
         HTML_TEMPLATE,
         hugs=HUG_GIFS,
@@ -2249,7 +2035,7 @@ def index():
         sender_name=SENDER_NAME,
         bot_name=BOT_NAME,
         chat_enabled=ENABLE_CHAT,
-        initial_pack=initial_pack,
+        initial_pack={"items": items} if items else None,
     )
 
 
